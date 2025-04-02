@@ -46,3 +46,4 @@ dlib-bin
 huggingface-hub==0.25.2
 soundfile
 pydantic==2.10.6
+gradio==4.44.1
