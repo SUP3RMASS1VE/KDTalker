@@ -20,6 +20,7 @@ from tqdm import tqdm
 import cv2
 from rich.progress import track
 import tyro
+import wave  # Add this import for audio validation
 
 import gradio as gr 
 from PIL import Image
@@ -193,23 +194,48 @@ class Inferencer(object):
     def extract_mel_from_audio(self, audio_file_path):
         syncnet_mel_step_size = 16
         fps = 25
-        wav = audio.load_wav(audio_file_path, 16000)
-        wav_length, num_frames = parse_audio_length(len(wav), 16000, 25)
-        wav = crop_pad_audio(wav, wav_length)
-        orig_mel = audio.melspectrogram(wav).T
-        spec = orig_mel.copy()
-        indiv_mels = []
+        try:
+            # Ensure the input file exists
+            if not os.path.exists(audio_file_path):
+                raise FileNotFoundError(f"Audio file {audio_file_path} not found")
+            
+            # Load and process the audio file
+            wav = audio.load_wav(audio_file_path, 16000)
+            
+            # Check if audio is too short
+            if len(wav) < 640:  # At least 40ms of audio (16000*0.04)
+                raise ValueError("Audio file is too short for processing")
+            
+            wav_length, num_frames = parse_audio_length(len(wav), 16000, 25)
+            
+            # Ensure we have at least one frame
+            if num_frames < 1:
+                raise ValueError("Audio is too short to extract features")
+            
+            wav = crop_pad_audio(wav, wav_length)
+            orig_mel = audio.melspectrogram(wav).T
+            spec = orig_mel.copy()
+            indiv_mels = []
 
-        for i in tqdm(range(num_frames), 'mel:'):
-            start_frame_num = i - 2
-            start_idx = int(80. * (start_frame_num / float(fps)))
-            end_idx = start_idx + syncnet_mel_step_size
-            seq = list(range(start_idx, end_idx))
-            seq = [min(max(item, 0), orig_mel.shape[0] - 1) for item in seq]
-            m = spec[seq, :]
-            indiv_mels.append(m.T)
-        indiv_mels = np.asarray(indiv_mels)  # T 80 16
-        return indiv_mels
+            for i in tqdm(range(num_frames), 'mel:'):
+                start_frame_num = i - 2
+                start_idx = int(80. * (start_frame_num / float(fps)))
+                end_idx = start_idx + syncnet_mel_step_size
+                seq = list(range(start_idx, end_idx))
+                seq = [min(max(item, 0), orig_mel.shape[0] - 1) for item in seq]
+                m = spec[seq, :]
+                indiv_mels.append(m.T)
+            
+            # Ensure we have the expected mel features
+            if len(indiv_mels) == 0:
+                raise ValueError("Failed to extract mel features from audio")
+            
+            indiv_mels = np.asarray(indiv_mels)  # T 80 16
+            return indiv_mels
+            
+        except Exception as e:
+            print(f"Error in extract_mel_from_audio: {str(e)}")
+            raise e
 
     def extract_wav2lip_from_audio(self, audio_file_path):
         asd_mel = self.extract_mel_from_audio(audio_file_path)
@@ -375,16 +401,100 @@ class Inferencer(object):
         os.remove(path)
         os.remove(new_audio_path)
 
-def gradio_infer(source_image, driven_audio):
-    
-    import tempfile
-    temp_dir = tempfile.mkdtemp()
-    output_path = f"{temp_dir}/output.mp4"
-    
-    Infer = Inferencer()
-    Infer.generate_with_audio_img(source_image, driven_audio, output_path)
+# Create outputs directory if it doesn't exist
+if not os.path.exists("outputs"):
+    os.makedirs("outputs")
 
-    return output_path
+def validate_audio_file(audio_path):
+    """Validate that the audio file is in a supported format"""
+    # Check file extension
+    if not audio_path.lower().endswith(('.wav', '.mp3')):
+        raise ValueError("Only WAV and MP3 audio formats are supported")
+    
+    # For WAV files, check sample rate and other properties
+    if audio_path.lower().endswith('.wav'):
+        try:
+            with wave.open(audio_path, 'rb') as wav_file:
+                # Check sample rate (should be 16000 for KDTalker)
+                sample_rate = wav_file.getframerate()
+                channels = wav_file.getnchannels()
+                
+                if sample_rate != 16000:
+                    print(f"Warning: Audio sample rate is {sample_rate}Hz, but 16000Hz is recommended")
+                
+                if channels > 1:
+                    print("Warning: Multi-channel audio detected. Mono audio is recommended")
+                    
+        except Exception as e:
+            raise ValueError(f"Invalid WAV file: {str(e)}")
+    
+    # Check file size (reject overly large files)
+    file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    if file_size_mb > 50:  # 50MB limit
+        raise ValueError(f"Audio file is too large ({file_size_mb:.1f}MB). Please use a file smaller than 50MB")
+    
+    return True
+
+def normalize_audio(input_audio_path):
+    """Convert audio to WAV format with 16kHz sample rate and mono channel"""
+    try:
+        # Generate a temporary filename
+        output_path = f"outputs/temp_{uuid.uuid4().hex[:8]}.wav"
+        
+        # Load the audio file with pydub (supports various formats)
+        audio = AudioSegment.from_file(input_audio_path)
+        
+        # Convert to mono if needed
+        if audio.channels > 1:
+            audio = audio.set_channels(1)
+        
+        # Set sample rate to 16kHz
+        audio = audio.set_frame_rate(16000)
+        
+        # Export as WAV
+        audio.export(output_path, format="wav")
+        
+        return output_path
+    except Exception as e:
+        raise ValueError(f"Failed to normalize audio: {str(e)}")
+
+def gradio_infer(source_image, driven_audio):
+    try:
+        temp_files = []
+        
+        # Validate inputs
+        if not source_image or not os.path.exists(source_image):
+            return gr.Error("Source image is required")
+        
+        if not driven_audio or not os.path.exists(driven_audio):
+            return gr.Error("Audio file is required")
+        
+        # Validate audio file
+        validate_audio_file(driven_audio)
+        
+        # Normalize audio to ensure compatibility
+        normalized_audio = normalize_audio(driven_audio)
+        temp_files.append(normalized_audio)
+        
+        # Generate a unique filename based on timestamp and random ID
+        unique_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        output_path = f"outputs/output_{unique_id}.mp4"
+        
+        Infer = Inferencer()
+        Infer.generate_with_audio_img(source_image, normalized_audio, output_path)
+        
+        # Clean up temporary files
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+                
+        return output_path
+    except Exception as e:
+        print(f"Error processing request: {str(e)}")
+        return gr.Error(f"Failed to process audio: {str(e)}. Please ensure your audio file is valid.")
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     # Header Section
@@ -408,12 +518,26 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             gr.Markdown("## Inputs")
             source_image = gr.Image(label="Source Image", type="filepath", height=300) # Add height hint
             driven_audio = gr.Audio(label="Driving Audio", type="filepath")
+            gr.Markdown("""
+            **Supported formats:**
+            - **Audio**: MP3, WAV (16kHz mono recommended)
+            - **Image**: JPG, PNG (clear face recommended)
+            - Audio files larger than 50MB are not supported
+            """)
             with gr.Row(): # Put button below inputs
                 submit_btn = gr.Button("Generate Video ✨", variant='primary') # Style button
 
         with gr.Column(scale=1): # Output Column
             gr.Markdown("## Output")
             output_video = gr.Video(label="Generated Talking Portrait", height=300) # Add height hint
+            gr.Markdown("""
+            **Processing time:** 1-3 minutes depending on audio length
+            
+            If you get an error:
+            - Try a different audio file
+            - Ensure your audio is good quality without background noise
+            - Check that the face in your image is clear and well-lit
+            """)
 
     gr.HTML("<hr>") # Add a horizontal rule separator
 
@@ -422,7 +546,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
          gr.Markdown(
              """
              <p align="center">
-             Built with Gradio | Model: KDTalker | [GitHub Repo (Placeholder)]()
+             Built with Gradio | Model: KDTalker 
              </p>
              """
          )
@@ -433,5 +557,5 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         outputs = [output_video]
     )
 
-demo.launch()
+demo.launch(server_name="127.0.0.1")
                 
