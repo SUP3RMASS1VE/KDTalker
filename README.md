@@ -63,4 +63,4 @@ KDTalker is based on "Unlock Pose Diversity: Accurate and Efficient Implicit Key
 
 ## License
 
-Please refer to the original model license on the [KDTalker GitHub repository](https://github.com/Chaolong/KDTalker). 
+Please refer to the original model license on the [KDTalker GitHub repository](https://github.com/chaolongy/KDTalker). 
